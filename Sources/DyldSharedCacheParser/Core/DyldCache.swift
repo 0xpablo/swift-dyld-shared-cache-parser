@@ -1,6 +1,82 @@
 import BinaryParsing
 import Foundation
 
+// MARK: - Lazy String Pool for Memory-Efficient Symbol Loading
+
+/// Memory-mapped string pool that streams data to a temp file and uses mmap for access.
+///
+/// This approach provides:
+/// - Fast initialization: One sequential read from the source (streaming in chunks)
+/// - Low memory: Only ~4MB buffer during streaming, then OS handles paging via mmap
+/// - Fast access: Direct memory access to mmap'd data
+public final class LazyStringPool: @unchecked Sendable {
+    private let mappedData: Data
+    private let tempFileURL: URL?
+
+    /// Creates a lazy string pool by streaming from source to a temp file and memory-mapping it.
+    ///
+    /// - Parameters:
+    ///   - source: The byte source to read from.
+    ///   - baseOffset: The offset in the source where the string pool starts.
+    ///   - totalSize: The total size of the string pool in bytes.
+    public init(
+        source: any DyldCacheByteSource,
+        baseOffset: Int,
+        totalSize: Int
+    ) throws {
+        // Create temp file
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent("dyld-strings-\(UUID().uuidString)")
+
+        // Create and open the file for writing
+        FileManager.default.createFile(atPath: tempFile.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: tempFile)
+
+        do {
+            // Stream from source to temp file in chunks to avoid memory spikes
+            let chunkSize = 4 * 1024 * 1024 // 4MB chunks
+            var offset = baseOffset
+            var remaining = totalSize
+
+            while remaining > 0 {
+                let readSize = min(chunkSize, remaining)
+                let chunk = try source.read(offset: offset, length: readSize)
+                try handle.write(contentsOf: chunk)
+                offset += readSize
+                remaining -= readSize
+            }
+
+            try handle.close()
+
+            // Memory-map the temp file - OS handles paging
+            self.mappedData = try Data(contentsOf: tempFile, options: .mappedIfSafe)
+            self.tempFileURL = tempFile
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: tempFile)
+            throw error
+        }
+    }
+
+    deinit {
+        if let url = tempFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Read a NUL-terminated string at the given pool offset.
+    ///
+    /// - Parameter poolOffset: The offset within the string pool.
+    /// - Returns: The string at that offset, or empty string if out of bounds.
+    public func string(at poolOffset: Int) -> String {
+        guard poolOffset >= 0, poolOffset < mappedData.count else { return "" }
+        let start = mappedData.startIndex + poolOffset
+        var end = start
+        while end < mappedData.endIndex, mappedData[end] != 0 { end += 1 }
+        return String(decoding: mappedData[start..<end], as: UTF8.self)
+    }
+}
+
 /// A parsed dyld shared cache.
 ///
 /// This is the main entry point for parsing dyld shared cache files.
@@ -478,23 +554,23 @@ extension DyldCache {
     /// The dyld local symbols format uses a single, global strings pool for all images in the cache.
     /// When the backing storage is compressed (e.g. APFS restore images), repeatedly reading and
     /// decompressing that pool per-image is extremely expensive.
-    public struct LocalSymbolsSharedContext: Sendable {
+    public struct LocalSymbolsSharedContext: @unchecked Sendable {
         public let info: LocalSymbolsInfo
         public let baseOffset: Int
         public let entriesOffset: Int
         public let nlistOffset: Int
-        public let strings: Data
+        public let stringPool: LazyStringPool
 
-        public init(info: LocalSymbolsInfo, baseOffset: Int, entriesOffset: Int, nlistOffset: Int, strings: Data) {
+        public init(info: LocalSymbolsInfo, baseOffset: Int, entriesOffset: Int, nlistOffset: Int, stringPool: LazyStringPool) {
             self.info = info
             self.baseOffset = baseOffset
             self.entriesOffset = entriesOffset
             self.nlistOffset = nlistOffset
-            self.strings = strings
+            self.stringPool = stringPool
         }
     }
 
-    /// Preloads the shared local-symbols strings pool and returns a context that can be reused.
+    /// Creates a shared context for accessing local symbols with lazy string pool loading.
     public func makeLocalSymbolsSharedContext(from symbolsSource: any DyldCacheByteSource) throws -> LocalSymbolsSharedContext? {
         guard let info = try localSymbolsInfo(from: symbolsSource) else { return nil }
 
@@ -512,13 +588,18 @@ extension DyldCache {
             )
         }
 
-        let strings = try symbolsSource.read(offset: stringsOffset, length: stringsByteCount)
+        let stringPool = try LazyStringPool(
+            source: symbolsSource,
+            baseOffset: stringsOffset,
+            totalSize: stringsByteCount
+        )
+
         return LocalSymbolsSharedContext(
             info: info,
             baseOffset: baseOffset,
             entriesOffset: entriesOffset,
             nlistOffset: nlistOffset,
-            strings: strings
+            stringPool: stringPool
         )
     }
 
@@ -602,7 +683,7 @@ extension DyldCache {
         return try localSymbols(forImageAt: index, from: symbolsSource, sharedContext: shared, is64BitEntries: is64BitEntries)
     }
 
-    /// Get local symbols for a specific image by index using a preloaded strings pool.
+    /// Get local symbols for a specific image by index using a shared context.
     public func localSymbols(
         forImageAt index: Int,
         from symbolsSource: any DyldCacheByteSource,
@@ -637,15 +718,7 @@ extension DyldCache {
         }
 
         let nlistBytes = try symbolsSource.read(offset: nlistOffset, length: nlistByteCount)
-        let strings = sharedContext.strings
-
-        func stringFromPool(at poolOffset: Int) -> String {
-            guard poolOffset >= 0, poolOffset < strings.count else { return "" }
-            let start = strings.startIndex + poolOffset
-            var end = start
-            while end < strings.endIndex, strings[end] != 0 { end += 1 }
-            return String(decoding: strings[start..<end], as: UTF8.self)
-        }
+        let stringPool = sharedContext.stringPool
 
         return try nlistBytes.withParserSpan { span in
             var symbols: [ResolvedSymbol] = []
@@ -653,7 +726,7 @@ extension DyldCache {
 
             for _ in 0..<entry.nlistCount {
                 let nlist = try NList64(parsing: &span)
-                let name = stringFromPool(at: Int(nlist.stringIndex))
+                let name = stringPool.string(at: Int(nlist.stringIndex))
                 if name.isEmpty { continue }
                 symbols.append(ResolvedSymbol(name: name, nlist: nlist, imageIndex: index))
             }
