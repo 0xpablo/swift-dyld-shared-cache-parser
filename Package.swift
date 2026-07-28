@@ -13,7 +13,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/apple/swift-binary-parsing",
-            branch: "main"
+            exact: "0.0.2"
         )
     ],
     targets: [

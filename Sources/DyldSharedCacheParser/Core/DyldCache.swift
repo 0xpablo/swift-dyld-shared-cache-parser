@@ -10,8 +10,14 @@ import Foundation
 /// - Low memory: Only ~4MB buffer during streaming, then OS handles paging via mmap
 /// - Fast access: Direct memory access to mmap'd data
 public final class LazyStringPool: @unchecked Sendable {
+    private static let defaultChunkSize = 4 * 1024 * 1024
+
     private let mappedData: Data
     private let tempFileURL: URL?
+
+    var backingFileURL: URL? {
+        tempFileURL
+    }
 
     /// Creates a lazy string pool by streaming from source to a temp file and memory-mapping it.
     ///
@@ -19,43 +25,87 @@ public final class LazyStringPool: @unchecked Sendable {
     ///   - source: The byte source to read from.
     ///   - baseOffset: The offset in the source where the string pool starts.
     ///   - totalSize: The total size of the string pool in bytes.
-    public init(
+    public convenience init(
         source: any DyldCacheByteSource,
         baseOffset: Int,
         totalSize: Int
     ) throws {
-        // Create temp file
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempFile = tempDir.appendingPathComponent("dyld-strings-\(UUID().uuidString)")
+        try self.init(
+            source: source,
+            baseOffset: baseOffset,
+            totalSize: totalSize,
+            temporaryDirectory: FileManager.default.temporaryDirectory
+        )
+    }
 
-        // Create and open the file for writing
-        FileManager.default.createFile(atPath: tempFile.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: tempFile)
+    init(
+        source: any DyldCacheByteSource,
+        baseOffset: Int,
+        totalSize: Int,
+        temporaryDirectory: URL,
+        chunkSize: Int = LazyStringPool.defaultChunkSize,
+        fileManager: FileManager = .default
+    ) throws {
+        let (endOffset, rangeOverflow) = baseOffset.addingReportingOverflow(totalSize)
+        guard
+            baseOffset >= 0,
+            totalSize >= 0,
+            chunkSize > 0,
+            !rangeOverflow,
+            endOffset <= source.size
+        else {
+            throw DyldCacheError.rangeOutOfBounds(
+                offset: UInt64(clamping: baseOffset),
+                size: UInt64(clamping: totalSize),
+                bufferSize: source.size
+            )
+        }
 
+        let tempFile = temporaryDirectory.appendingPathComponent("dyld-strings-\(UUID().uuidString)")
+        var handle: FileHandle?
+        let data: Data
         do {
+            guard fileManager.createFile(
+                atPath: tempFile.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            handle = try FileHandle(forWritingTo: tempFile)
+
             // Stream from source to temp file in chunks to avoid memory spikes
-            let chunkSize = 4 * 1024 * 1024 // 4MB chunks
             var offset = baseOffset
             var remaining = totalSize
 
             while remaining > 0 {
                 let readSize = min(chunkSize, remaining)
                 let chunk = try source.read(offset: offset, length: readSize)
-                try handle.write(contentsOf: chunk)
-                offset += readSize
-                remaining -= readSize
+                guard chunk.count == readSize else {
+                    throw DyldCacheError.rangeOutOfBounds(
+                        offset: UInt64(offset),
+                        size: UInt64(readSize),
+                        bufferSize: source.size
+                    )
+                }
+                try handle?.write(contentsOf: chunk)
+                offset += chunk.count
+                remaining -= chunk.count
             }
 
-            try handle.close()
+            try handle?.close()
+            handle = nil
 
             // Memory-map the temp file - OS handles paging
-            self.mappedData = try Data(contentsOf: tempFile, options: .mappedIfSafe)
-            self.tempFileURL = tempFile
+            data = try Data(contentsOf: tempFile, options: .mappedIfSafe)
         } catch {
-            try? handle.close()
-            try? FileManager.default.removeItem(at: tempFile)
+            try? handle?.close()
+            try? fileManager.removeItem(at: tempFile)
             throw error
         }
+
+        self.mappedData = data
+        self.tempFileURL = tempFile
     }
 
     deinit {
@@ -461,9 +511,8 @@ extension DyldCache {
     public func localSymbolsInfo(from data: Data) throws -> LocalSymbolsInfo? {
         guard header.localSymbolsSize > 0 else { return nil }
 
-        let offset = Int(header.localSymbolsOffset)
-        guard offset < data.count else {
-            throw DyldCacheError.offsetOutOfBounds(offset: UInt64(offset), bufferSize: data.count)
+        guard let offset = Int(exactly: header.localSymbolsOffset), offset < data.count else {
+            throw DyldCacheError.offsetOutOfBounds(offset: header.localSymbolsOffset, bufferSize: data.count)
         }
 
         return try data.withParserSpan { span in
@@ -510,11 +559,11 @@ extension DyldCache {
     /// Read local symbols info from the cache using a byte source.
     public func localSymbolsInfo(from source: any DyldCacheByteSource) throws -> LocalSymbolsInfo? {
         guard header.localSymbolsSize > 0 else { return nil }
-        let offset = Int(header.localSymbolsOffset)
-        guard offset >= 0, offset < source.size else {
+        guard let offset = Int(exactly: header.localSymbolsOffset), offset < source.size else {
             throw DyldCacheError.offsetOutOfBounds(offset: header.localSymbolsOffset, bufferSize: source.size)
         }
-        if offset + LocalSymbolsInfo.size > source.size {
+        let (endOffset, rangeOverflow) = offset.addingReportingOverflow(LocalSymbolsInfo.size)
+        if rangeOverflow || endOffset > source.size {
             throw DyldCacheError.rangeOutOfBounds(offset: header.localSymbolsOffset, size: UInt64(LocalSymbolsInfo.size), bufferSize: source.size)
         }
         let bytes = try source.read(offset: offset, length: LocalSymbolsInfo.size)
@@ -574,15 +623,31 @@ extension DyldCache {
     public func makeLocalSymbolsSharedContext(from symbolsSource: any DyldCacheByteSource) throws -> LocalSymbolsSharedContext? {
         guard let info = try localSymbolsInfo(from: symbolsSource) else { return nil }
 
-        let baseOffset = Int(header.localSymbolsOffset)
-        let entriesOffset = baseOffset + Int(info.entriesOffset)
-        let nlistOffset = baseOffset + Int(info.nlistOffset)
+        guard let baseOffset = Int(exactly: header.localSymbolsOffset) else {
+            throw DyldCacheError.offsetOutOfBounds(
+                offset: header.localSymbolsOffset,
+                bufferSize: symbolsSource.size
+            )
+        }
+        let (entriesOffset, entriesOffsetOverflow) =
+            baseOffset.addingReportingOverflow(Int(info.entriesOffset))
+        let (nlistOffset, nlistOffsetOverflow) =
+            baseOffset.addingReportingOverflow(Int(info.nlistOffset))
+        let (stringsOffset, stringsOffsetOverflow) =
+            baseOffset.addingReportingOverflow(Int(info.stringsOffset))
 
-        let stringsOffset = baseOffset + Int(info.stringsOffset)
         let stringsByteCount = Int(info.stringsSize)
-        if stringsOffset < 0 || stringsOffset + stringsByteCount > symbolsSource.size {
+        let (stringsEndOffset, stringsRangeOverflow) =
+            stringsOffset.addingReportingOverflow(stringsByteCount)
+        if
+            entriesOffsetOverflow
+                || nlistOffsetOverflow
+                || stringsOffsetOverflow
+                || stringsRangeOverflow
+                || stringsEndOffset > symbolsSource.size
+        {
             throw DyldCacheError.rangeOutOfBounds(
-                offset: UInt64(stringsOffset),
+                offset: header.localSymbolsOffset,
                 size: UInt64(stringsByteCount),
                 bufferSize: symbolsSource.size
             )

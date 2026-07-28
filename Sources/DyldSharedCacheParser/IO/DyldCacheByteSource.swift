@@ -27,7 +27,8 @@ public struct DataByteSource: DyldCacheByteSource, Sendable {
     public func read(offset: Int, length: Int) throws -> Data {
         if length <= 0 { return Data() }
         guard offset >= 0, offset < data.count else { return Data() }
-        let end = min(data.count, offset + length)
+        let (requestedEnd, overflow) = offset.addingReportingOverflow(length)
+        let end = overflow ? data.count : min(data.count, requestedEnd)
         return data[offset..<end]
     }
 }
@@ -67,4 +68,3 @@ extension DyldCacheByteSource {
         return String(decoding: out, as: UTF8.self)
     }
 }
-

@@ -720,6 +720,103 @@ struct LocalSymbolsTests {
         #expect(entries.count == 1)
         #expect(entries[0].nlistCount == 1)
     }
+
+    @Test("Lazy string pool streams large pools in bounded chunks")
+    func testLazyStringPoolStreamsLargePools() throws {
+        let chunkSize = 4 * 1024 * 1024
+        let symbolName = "symbol_across_chunk_boundary"
+        let symbolOffset = chunkSize - 8
+        var data = Data(repeating: 0x78, count: chunkSize * 2 + 123)
+        data.replaceSubrange(
+            symbolOffset..<(symbolOffset + symbolName.utf8.count + 1),
+            with: Data(symbolName.utf8) + Data([0])
+        )
+        let source = RecordingByteSource(data)
+        let temporaryDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        var pool: LazyStringPool? = try LazyStringPool(
+            source: source,
+            baseOffset: 0,
+            totalSize: data.count,
+            temporaryDirectory: temporaryDirectory
+        )
+        let backingFileURL = try #require(pool?.backingFileURL)
+
+        #expect(pool?.string(at: symbolOffset) == symbolName)
+        #expect(source.readLengths == [chunkSize, chunkSize, 123])
+        #expect(FileManager.default.fileExists(atPath: backingFileURL.path))
+        let attributes = try FileManager.default.attributesOfItem(atPath: backingFileURL.path)
+        let permissions = attributes[.posixPermissions] as? NSNumber
+        #expect(permissions?.intValue == 0o600)
+
+        pool = nil
+        #expect(!FileManager.default.fileExists(atPath: backingFileURL.path))
+    }
+
+    @Test("Lazy string pool rejects short reads and removes its temporary file")
+    func testLazyStringPoolRejectsShortReads() throws {
+        let temporaryDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let source = ShortReadByteSource(size: 64)
+
+        #expect(throws: DyldCacheError.self) {
+            _ = try LazyStringPool(
+                source: source,
+                baseOffset: 0,
+                totalSize: source.size,
+                temporaryDirectory: temporaryDirectory,
+                chunkSize: 16
+            )
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path).isEmpty)
+    }
+
+    @Test("Local symbols reject a claimed string pool beyond the source")
+    func testLocalSymbolsRejectClaimedStringPoolBeyondSource() throws {
+        let baseOffset = 0x40
+        var data = Data(repeating: 0, count: baseOffset)
+        data.append(contentsOf: u32(UInt32(LocalSymbolsInfo.size)))
+        data.append(contentsOf: u32(0))
+        data.append(contentsOf: u32(UInt32(LocalSymbolsInfo.size)))
+        data.append(contentsOf: u32(4096))
+        data.append(contentsOf: u32(UInt32(LocalSymbolsInfo.size)))
+        data.append(contentsOf: u32(0))
+        let cache = DyldCache(
+            header: makeTestHeader(
+                localSymbolsOffset: UInt64(baseOffset),
+                localSymbolsSize: UInt64(LocalSymbolsInfo.size)
+            ),
+            mappings: [],
+            mappingsWithSlide: [],
+            images: [],
+            imagesText: [],
+            subCaches: []
+        )
+
+        #expect(throws: DyldCacheError.self) {
+            _ = try cache.makeLocalSymbolsSharedContext(from: DataByteSource(data))
+        }
+    }
+
+    @Test("Local symbols reject offsets that cannot be represented")
+    func testLocalSymbolsRejectUnrepresentableOffset() throws {
+        let cache = DyldCache(
+            header: makeTestHeader(
+                localSymbolsOffset: UInt64.max,
+                localSymbolsSize: UInt64(LocalSymbolsInfo.size)
+            ),
+            mappings: [],
+            mappingsWithSlide: [],
+            images: [],
+            imagesText: [],
+            subCaches: []
+        )
+
+        #expect(throws: DyldCacheError.self) {
+            _ = try cache.localSymbolsInfo(from: DataByteSource(Data(repeating: 0, count: 64)))
+        }
+    }
 }
 
 // MARK: - Helpers
@@ -747,6 +844,48 @@ private func fixedCString16(_ string: String) -> [UInt8] {
 private func appendUUID(_ uuid: UUID, to data: inout Data) {
     var raw = uuid.uuid
     withUnsafeBytes(of: &raw) { data.append(contentsOf: $0) }
+}
+
+private final class RecordingByteSource: DyldCacheByteSource, @unchecked Sendable {
+    let data: Data
+    private let lock = NSLock()
+    private var recordedReadLengths: [Int] = []
+
+    init(_ data: Data) {
+        self.data = data
+    }
+
+    var size: Int {
+        data.count
+    }
+
+    var readLengths: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedReadLengths
+    }
+
+    func read(offset: Int, length: Int) throws -> Data {
+        lock.lock()
+        recordedReadLengths.append(length)
+        lock.unlock()
+        return try DataByteSource(data).read(offset: offset, length: length)
+    }
+}
+
+private struct ShortReadByteSource: DyldCacheByteSource {
+    let size: Int
+
+    func read(offset: Int, length: Int) throws -> Data {
+        Data(repeating: 0, count: max(0, length - 1))
+    }
+}
+
+private func makeTemporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dyld-parser-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+    return url
 }
 
 private let nullUUID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
