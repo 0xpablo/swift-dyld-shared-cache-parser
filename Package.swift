@@ -12,8 +12,8 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/apple/swift-binary-parsing",
-            exact: "0.0.2"
+            url: "https://github.com/0xpablo/swift-binary-parsing",
+            exact: "0.0.2-0xpablo.1"
         )
     ],
     targets: [
